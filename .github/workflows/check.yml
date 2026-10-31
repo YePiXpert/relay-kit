@@ -1,0 +1,26 @@
+name: Check scripts
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Check shell scripts
+        run: |
+          bash -n forward.sh
+          bash -n install.sh
+          bash -n tests/test-install.sh
+          shellcheck forward.sh install.sh tests/test-install.sh
+      - name: Test menu and failure handling
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Test isolated local installation
+        run: sudo unshare --mount bash tests/test-install.sh

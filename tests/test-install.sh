@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Run with: sudo unshare --mount bash tests/test-install.sh
+# Test installation in a private mount; never overwrite host executables.
+set -Eeuo pipefail
+[[ $(readlink /proc/self/ns/mnt) != "$(readlink /proc/1/ns/mnt)" ]] || {
+    printf 'Run with sudo unshare --mount bash tests/test-install.sh\n' >&2
+    exit 1
+}
+mount --make-rprivate /
+mount -t tmpfs tmpfs /usr/local/bin
+bash forward.sh --install
+[[ $(/usr/local/bin/relay --version) == 'Relay Kit 0.1.0' ]]
+[[ $(stat -c '%a' /usr/local/bin/relay) == 755 ]]
+bash forward.sh --install
+printf 'unrelated application\n' > /usr/local/bin/relay
+if bash forward.sh --install; then
+    printf 'Unexpectedly overwrote an unrelated executable\n' >&2
+    exit 1
+fi
+[[ $(cat /usr/local/bin/relay) == 'unrelated application' ]]
+rm /usr/local/bin/relay
+ln -s /usr/bin/true /usr/local/bin/relay
+if bash forward.sh --install; then
+    printf 'Unexpectedly overwrote a symlink\n' >&2
+    exit 1
+fi
+[[ $(readlink /usr/local/bin/relay) == /usr/bin/true ]]
+printf 'PASS install, update, executable mode and unrelated-file/symlink protection\n'

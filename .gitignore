@@ -1,0 +1,10 @@
+.test-tools/
+dist/
+__pycache__/
+*.pyc
+# Earlier local prototypes, not part of the published Relay Kit project.
+po0-forward.sh
+CUSTOM-NFT.md
+tests/network.sh
+tests/echo-server.py
+tests/probe.py
