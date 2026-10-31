@@ -115,7 +115,7 @@ def sing_client(node):
     outbound = {"type": "snell" if kind.startswith("snell") else kind, "server": "198.18.0.1",
                 "server_port": node["listen"]}
     if kind.startswith("snell"):
-        outbound.update(version=6 if kind == "snell6" else 5, psk=keys["password"])
+        outbound.update(version=6 if kind == "snell6" else 4, psk=keys["password"])
     else:
         outbound.update(password=keys["password"], tls={"enabled": True, "server_name": "target.example",
                          "certificate": nodes.pem(opts["cert"])})
