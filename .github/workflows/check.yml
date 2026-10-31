@@ -12,15 +12,22 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install ShellCheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Install test dependencies
+        run: sudo apt-get update && sudo apt-get install -y shellcheck nftables iproute2 openssl
       - name: Check shell scripts
         run: |
           bash -n forward.sh
           bash -n install.sh
           bash -n tests/test-install.sh
-          shellcheck forward.sh install.sh tests/test-install.sh
+          bash -n tests/run-network.sh
+          shellcheck forward.sh install.sh tests/test-install.sh tests/run-network.sh
       - name: Test menu and failure handling
         run: python3 -m unittest discover -s tests -p 'test_*.py' -v
       - name: Test isolated local installation
         run: sudo unshare --mount bash tests/test-install.sh
+      - name: Download pinned official test runtimes
+        run: python3 tests/fetch-cores.py
+      - name: Test forwarding and all node protocols in private network namespaces
+        run: sudo unshare --mount --net --pid --fork bash tests/run-network.sh
+      - name: Test real systemd credential isolation
+        run: sudo python3 tests/test-systemd.py

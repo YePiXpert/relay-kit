@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # Run with: sudo unshare --mount bash tests/test-install.sh
-# Test installation in a private mount; never overwrite host executables.
 set -Eeuo pipefail
 [[ $(readlink /proc/self/ns/mnt) != "$(readlink /proc/1/ns/mnt)" ]] || {
     printf 'Run with sudo unshare --mount bash tests/test-install.sh\n' >&2
@@ -8,9 +7,11 @@ set -Eeuo pipefail
 }
 mount --make-rprivate /
 mount -t tmpfs tmpfs /usr/local/bin
+mount -t tmpfs tmpfs /usr/local/lib
 bash forward.sh --install
-[[ $(/usr/local/bin/relay --version) == 'Relay Kit 0.1.0' ]]
+[[ $(/usr/local/bin/relay --version) == 'Relay Kit 0.2.0' ]]
 [[ $(stat -c '%a' /usr/local/bin/relay) == 755 ]]
+[[ $(stat -c '%a' /usr/local/lib/relay-kit/relay.py) == 644 ]]
 bash forward.sh --install
 printf 'unrelated application\n' > /usr/local/bin/relay
 if bash forward.sh --install; then
@@ -25,4 +26,4 @@ if bash forward.sh --install; then
     exit 1
 fi
 [[ $(readlink /usr/local/bin/relay) == /usr/bin/true ]]
-printf 'PASS install, update, executable mode and unrelated-file/symlink protection\n'
+printf 'PASS install, update, permissions and unrelated-file protection\n'

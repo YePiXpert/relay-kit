@@ -1,133 +1,156 @@
 # Relay Kit
 
-面向 Debian / Ubuntu 的中文转发管理入口。运行同一个脚本，自己选择 **nftables** 或 **Realm**，适用于 VPS 中转、端口映射和多段转发。
+自己的转发、节点和 BBR 管理工具。面向 **Debian 11+ / Ubuntu 22.04+、systemd、x86_64 / aarch64**。
+
+安装、菜单、配置生成、服务管理和回退代码独立编写。不会下载或执行 arloor、realm-xwPF、mozisen 等第三方管理脚本。转发/代理运行时仍使用系统 nftables，以及固定版本的官方 Realm、Xray、sing-box、Snell 二进制，下载时校验 SHA-256。
+
+## 一键安装
+
+在服务器上执行，安装后输入 `relay` 打开菜单：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/YePiXpert/relay-kit/main/install.sh -o relay-install.sh && sudo bash relay-install.sh && sudo relay
+```
+
+root 用户可省略 `sudo`。使用 wget 也可以：
+
+```bash
+wget -O relay-install.sh https://raw.githubusercontent.com/YePiXpert/relay-kit/main/install.sh && sudo bash relay-install.sh && sudo relay
+```
+
+安装器只下载本仓库 **v0.2.0** 标签的三个源文件，并核对内置 SHA-256。运行核心在选择相应功能时安装。离线查看代码或本地安装：下载完整仓库后执行 `sudo bash forward.sh --install`，不要只下载 forward.sh。
+
+## 菜单
 
 ```text
-Relay Kit 0.1.0 — 请选择转发方式
-1) nftables（arloor）
-2) Realm（realm-xwPF）
+1) nftables 转发
+2) Realm 转发
+3) 搭建/管理节点
+4) BBR
 0) 退出
 ```
 
-这是独立维护的菜单和安装入口：nftables 管理由 [arloor/nftables-nat-rust](https://github.com/arloor/nftables-nat-rust) 提供，Realm 管理由 [zywe03/realm-xwPF](https://github.com/zywe03/realm-xwPF) 提供。转发能力、上游配置和许可证归各自项目。
+不包含订阅服务、流量计费、多用户管理、分流、链式代理或 TG 机器人。
 
-## 快速开始
+## 转发
 
-在 Linux 服务器上下载并安装菜单：
-
-```bash
-sudo apt-get update
-sudo apt-get install -y curl ca-certificates
-curl -fL --proto '=https' --proto-redir '=https' \
-  https://raw.githubusercontent.com/YePiXpert/relay-kit/main/install.sh \
-  -o relay-install.sh
-sudo bash relay-install.sh
-sudo relay
-```
-
-安装菜单只创建 `/usr/local/bin/relay`。进入菜单后选择引擎，再选择安装，不会同时安装两个引擎。
-
-已有源码或 GitHub ZIP 包时，也可以跳过菜单下载：
+同一台服务器选择 nftables 或 Realm 作为转发引擎，支持多条规则、TCP、UDP、修改、删除和启停。节点模块可同时运行，入口端口不能冲突。
 
 ```bash
-sudo bash forward.sh --install
-sudo relay
+sudo relay init nft
+sudo relay add hk1 both 20000 203.0.113.10 30000
+sudo relay list
+sudo relay set hk1 tcp 20000 203.0.113.20 443
+sudo relay disable hk1
+sudo relay enable hk1
+sudo relay del hk1
+sudo relay status
+sudo relay logs nft
 ```
 
-不安装快捷命令也能直接运行 `sudo bash forward.sh`。更新菜单可重新运行上面的安装步骤；转发引擎在各自子菜单中更新。
+上面的文档地址须换成真实目标地址。`relay init realm` 可切换到 Realm；切换会短暂中断转发，保留规则，并验证新引擎能否接受配置。
 
-## 命令
+- nftables：IPv4 DNAT + masquerade；只管理 `table ip relay_kit`。入口是到本机地址的入站流量，不转发本机 OUTPUT 流量。
+- Realm：入口 IPv4，目标支持 IPv4、IPv6、域名；按规则使用核心原生 TCP/UDP 配置。
+- 不清空系统防火墙，不调整其他 filter/FORWARD 策略。云安全组、本机防火墙仍需允许相应流量。
+- 拒绝占用 SSH 端口、程序正在监听的端口及本工具其他模块占用的端口。
+- 配置校验后应用；失败时尝试恢复上一份配置，失败详情会明确显示。已有连接可能因服务重启中断。
 
-| 命令 | 功能 |
-| --- | --- |
-| `sudo relay` | 选择转发引擎 |
-| `sudo relay nft` | 进入 nftables 安装、配置和诊断菜单 |
-| `sudo relay realm` | 进入 Realm 安装和管理入口 |
-| `relay --version` | 显示版本 |
-| `relay --help` | 显示帮助 |
+## 节点
 
-运行菜单不需要联网；下载安装转发后端时需要访问上游 GitHub 和系统软件源。
+菜单有 17 种协议/模式，每个节点对应一个独立 systemd 服务和一组随机凭据。
 
-## 两种转发方式
-
-| 方式 | 提供的能力 | 使用入口 |
-| --- | --- | --- |
-| nftables | 内核 NAT、TCP/UDP、IPv4/IPv6、域名解析更新、端口段 | 编辑 `/etc/nat.toml`；`nat.service` |
-| Realm | 用户态 TCP/UDP、交互式规则管理、负载均衡、导入导出 | 上游中文菜单；`realm.service` |
-
-- nftables 安装走 arloor 的 TOML 配置方式；配置更新通常在 60 秒内被程序检测，无需每次重启。安装脚本中的 GitHub 下载代理前缀会替换为直连 GitHub。
-- Realm 使用 realm-xwPF 管理，后续增加规则、删除规则、服务管理等在其菜单中完成。
-- 两个引擎各自维护配置。选择另一个菜单不等于迁移已有规则；同一台机器切换同一个入口端口时，先在原管理器中移除冲突规则。
-- 此入口不安装 Web 面板。上游提供的隧道、流量统计等扩展功能按需使用。
-
-## 环境要求与影响
-
-- Debian / Ubuntu，Bash，systemd；安装和变更系统配置需要 root。
-- 当前 nftables 安装路径只接入 **x86_64**；Realm 架构支持由上游安装器检测。
-- 安装器下载上游当前分支及其指定的版本，不是冻结的供应链快照。
-- arloor 的 Docker 兼容逻辑可能将 FORWARD 策略调整为 ACCEPT；已有复杂防火墙时，应先了解其对当前策略的影响。参见[上游说明](https://github.com/arloor/nftables-nat-rust#-docker-兼容性)。
-- 云安全组和本机防火墙需允许所用端口；转发无法替代后端服务，也不会创建运营商专线。
-- `/usr/local/bin/relay` 若已属于其他程序或是符号链接，安装会停止，避免覆盖其他工具。
-
-## 转发配置示例
-
-```text
-客户端 → 入口机:20000 → 中转机:30000 → 落地机:40000
-```
-
-示例地址来自文档专用地址段，必须换成真实地址。
-
-**中转机选择 Realm**：添加标准转发，监听 `0.0.0.0:30000`，目标 `198.51.100.20:40000`，协议按业务需要选择 TCP、UDP 或 both。先验证此段可用。
-
-**入口机选择 nftables**：编辑 `/etc/nat.toml`，新安装的空配置可替换为：
-
-```toml
-[[rules]]
-type = "single"
-sport = 20000
-dport = 30000
-domain = "203.0.113.10"
-protocol = "all"
-ip_version = "ipv4"
-comment = "entry to relay"
-```
-
-`203.0.113.10` 换成入口机能访问的中转机地址。已有规则时追加 `[[rules]]`；初始空配置中的 `rules = []` 不能与后续 `[[rules]]` 同时保留。
-
-客户端连接入口机的公网 IP 和 `20000` 端口。无需每一段使用相同引擎，也可以只部署单层转发。
-
-## 诊断
+| 命令中的协议名 | 节点 | 核心 | 证书 |
+| --- | --- | --- | --- |
+| reality | VLESS + REALITY | Xray | 不需要，填写目标网站 SNI |
+| reality-xhttp | VLESS + REALITY + XHTTP | Xray | 同上 |
+| vless-encryption | VLESS Encryption | Xray | 不需要 |
+| vless-ws | VLESS + WS + TLS | Xray | 需要 |
+| vmess-ws | VMess + WS | Xray | 可选 --tls |
+| vless-vision | VLESS + XTLS Vision | Xray | 需要 |
+| trojan | Trojan | Xray | 需要 |
+| hysteria2 | Hysteria2 | sing-box | 需要 |
+| ss2022 | Shadowsocks 2022 / AES-128-GCM | Xray | 不需要 |
+| shadowsocks | 传统 Shadowsocks AEAD | Xray | 不需要 |
+| socks5 | SOCKS5 密码认证 | Xray | 不需要 |
+| snell4 / snell5 / snell6 | Snell v4 / v5 / v6 | 官方 Snell | 不需要 |
+| anytls | AnyTLS | sing-box | 需要 |
+| tuic | TUIC v5 | sing-box | 需要 |
+| naive | NaiveProxy | sing-box | 需要，分享地址须与证书域名相同 |
 
 ```bash
-# nftables 后端
-sudo systemctl status nat --no-pager
-sudo journalctl -u nat -n 50 --no-pager
-
-# Realm 后端
-sudo systemctl status realm --no-pager
-sudo journalctl -u realm -n 50 --no-pager
+# 将示例 IP、域名和端口替换为你的参数
+sudo relay node add reality hk 443 203.0.113.10 --sni your-target.example
+sudo relay node add ss2022 ss1 8388 203.0.113.10
+sudo relay node add snell6 surge1 6160 203.0.113.10
+sudo relay node list
+sudo relay node link hk
+sudo relay node set hk --port 8443
+sudo relay node set hk --rotate
+sudo relay node disable hk
+sudo relay node enable hk
+sudo relay node status hk
+sudo relay node logs hk
+sudo relay node del hk
 ```
 
-nftables 规则不表现为 `ss` 中的本地监听进程；Realm 则会创建监听 socket。测试 nftables 入口时使用另一台机器，避免本机测试绕过 PREROUTING。
+`--rotate` 更换凭据后需要重新导入连接信息。Snell 导出 Surge 配置行，其余导出对应连接链接。默认监听 `0.0.0.0`；IPv6 入口可用 `--bind ::`，客户端和系统需支持 IPv6。
 
-## 开发与验证
+TLS 节点使用现有证书：
 
 ```bash
-bash -n forward.sh
-bash -n install.sh
-shellcheck forward.sh install.sh
+sudo relay node add hysteria2 hy1 8443 node.example.com \
+  --sni node.example.com \
+  --cert /etc/letsencrypt/live/node.example.com/fullchain.pem \
+  --key /etc/letsencrypt/live/node.example.com/privkey.pem
+```
+
+也可在菜单申请 Let's Encrypt，或执行 `sudo relay cert node.example.com your@email.example`。该功能通过系统仓库安装 Certbot，使用 HTTP-01 并接受 Let's Encrypt 服务条款；域名应指向服务器，TCP/80 必须空闲且公网可达。安装续期部署钩子，成功续期后重新应用节点配置。
+
+其他参数：
+
+- WS/XHTTP：`--path /your-path`。
+- Vision/Trojan：`--fallback 8080`，将未通过代理认证的连接回落至本机服务。
+- Shadowsocks：`--method aes-128-gcm|aes-256-gcm|chacha20-poly1305`。
+- Snell v4/v5：`--obfs http`；Snell v6：`--mode default|unshaped`；Snell：`--dns 1.1.1.1,8.8.8.8`。
+- Hysteria2：可选 `--up-mbps 100 --down-mbps 100`。
+- 高级参数也可通过 `relay node set 名称 ...` 修改。
+
+Hysteria2/TUIC 入口使用 UDP；SS 两种模式、Snell v5 和 Naive 支持 UDP 入口；其余主要入口为 TCP。SOCKS5 的 UDP ASSOCIATE 按请求创建 UDP 套接字，若使用该功能须配置相应防火墙策略。SOCKS5 本身不加密传输。
+
+## BBR
+
+```bash
+sudo relay bbr status
+sudo relay bbr on
+sudo relay bbr off
+```
+
+`on` 设置 fq + bbr，并保存原值；`off` 恢复保存的原值。只使用现有内核能力，内核不支持时返回错误，不替换内核。BBR 是系统 TCP 拥塞控制设置，对 QUIC 协议自带的拥塞控制不生效。
+
+## 文件和运行依赖
+
+- 管理入口：`/usr/local/bin/relay`。
+- 管理代码及核心：`/usr/local/lib/relay-kit/`。
+- 转发状态：`/etc/relay-kit/forward.json`。
+- 节点状态：`/etc/relay-kit/nodes.json`；私钥和凭据文件权限 600。
+- 节点服务：`relay-node-节点名称.service`；使用 DynamicUser 和 systemd LoadCredential。
+- 转发服务：`relay-kit-nft.service` / `relay-kit-realm.service`。
+- BBR：`/etc/sysctl.d/99-relay-kit-bbr.conf`。
+- 最近一次状态备份：对应的 `.json.bak` 文件。
+
+运行核心固定为 Realm 2.9.6、Xray 26.10.29、sing-box 1.14.4、Snell 4.1.1 / 5.0.1 / 6.0.0。校验值和官方下载地址均在源码中，可直接审阅。SHA-256 用于确认下载内容符合固定版本，并不等于对核心实现做过完整安全审计。各运行组件保留各自许可证；本仓库管理代码采用 MIT。
+
+从旧 0.1.0 更新会替换 Relay Kit 管理入口，不会删除此前由其他工具安装的 nat/xwPF 服务，也不会自动迁移其规则。请先停用冲突的旧服务，再添加本工具的规则。
+
+## 验证
+
+```bash
 python3 -m unittest discover -s tests -p 'test_*.py' -v
 sudo unshare --mount bash tests/test-install.sh
+python3 tests/fetch-cores.py
+sudo unshare --mount --net --pid --fork bash tests/run-network.sh
+sudo python3 tests/test-systemd.py
 ```
 
-测试覆盖菜单选择、返回、直接进入引擎、版本帮助、异常参数、输入结束和下载失败时禁止执行。另在隔离挂载空间验证安装、更新、可执行权限及保护其他文件/符号链接。GitHub Actions 运行相同检查，不安装转发后端、不修改防火墙。
-
-当前测试不等同于在真实 VPS 上完成上游安装和整条转发链路验收；请根据实际路由、端口和防火墙进行连接测试。
-
-## 致谢与许可
-
-- [arloor/nftables-nat-rust](https://github.com/arloor/nftables-nat-rust)：nftables 转发管理。
-- [zywe03/realm-xwPF](https://github.com/zywe03/realm-xwPF)：Realm 交互式管理。
-- [zhboner/realm](https://github.com/zhboner/realm)：Realm 转发程序。
-
-Relay Kit 自有脚本采用 [MIT License](LICENSE)。本仓库不打包上游源码或二进制，上游项目遵循各自许可证。
+自动测试覆盖输入和下载校验、端口冲突、失败回退、BBR 恢复、安装保护、真实 nftables/Realm TCP 和 UDP 收发，以及 17 种节点模式的官方核心配置和代理连接。网络测试在独立命名空间中运行，不改变主机网络。systemd 测试使用临时服务和私有网络，结束后清理。当前实测环境为 Ubuntu 24.04 x86_64；ARM64 下载校验值已固定，但未在 ARM64 硬件上运行测试。
