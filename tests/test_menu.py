@@ -253,6 +253,13 @@ class Transactions(unittest.TestCase):
                 self.manager.check_ports(state(), None)
             self.manager.check_ports(state(), state())
 
+    def test_commit_fetches_newly_pinned_cores_first(self):
+        nodes_manager = relay.NodeManager(self.temp.name)
+        with mock.patch.object(nodes_manager, "install_core") as install, mock.patch.object(nodes_manager, "check"), \
+                mock.patch.object(nodes_manager, "sync"), contextlib.redirect_stdout(io.StringIO()):
+            nodes_manager.commit({"nodes": [ss_node(), ss_node(name="off", listen=20002, enabled=False)]})
+        install.assert_called_once_with("xray")
+
     def test_nft_unit_follows_nftables_service_restarts(self):
         with mock.patch.object(relay, "run", side_effect=ok) as command:
             self.manager.write_units()

@@ -18,7 +18,7 @@ root 用户可省略 `sudo`。使用 wget 也可以：
 wget -O relay-install.sh https://raw.githubusercontent.com/YePiXpert/relay-kit/main/install.sh && sudo bash relay-install.sh && sudo relay
 ```
 
-安装器只下载本仓库 **v0.3.0** 标签的四个源文件（forward.sh、relay.py、nodes.py、menu.py），并核对内置 SHA-256。运行核心在选择相应功能时安装。离线查看代码或本地安装：下载完整仓库后执行 `sudo bash forward.sh --install`，不要只下载 forward.sh。
+安装器只下载本仓库 **v0.3.1** 标签的四个源文件（forward.sh、relay.py、nodes.py、menu.py），并核对内置 SHA-256。运行核心在选择相应功能时安装。离线查看代码或本地安装：下载完整仓库后执行 `sudo bash forward.sh --install`，不要只下载 forward.sh。
 
 服务器直连 GitHub 失败时，安装器和核心下载会依次改用镜像 `ghfast.top`、`gh-proxy.com`。镜像下载的内容同样要通过内置 SHA-256 校验，不符就丢弃。`RELAY_KIT_MIRRORS` 可以指定镜像前缀（空格或逗号分隔），设为空则只直连。连安装器本身都下载不了时（如 Po0），可以经镜像取安装器：
 
@@ -32,7 +32,7 @@ curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/YePiXpert/relay-
 
 ```text
 ══════════════════════════════════════════════════════════
-  Relay Kit v0.3.0  │  转发 · 节点 · BBR
+  Relay Kit v0.3.1  │  转发 · 节点 · BBR
   快捷命令 relay · 命令行用法 relay -h
 ══════════════════════════════════════════════════════════
   系统  Debian GNU/Linux 12 (bookworm) · 6.1.0-28-amd64 · x86_64
@@ -222,10 +222,11 @@ sudo relay uninstall        # 需输入 yes 确认；加 --yes 跳过确认
 - 最近一次状态备份：对应的 `.json.bak` 文件。
 - 防火墙放行记录：`/etc/relay-kit/firewall.json`。
 
-运行核心固定为 Realm 2.9.6、Xray 26.10.29、sing-box 1.14.4、Snell 4.1.1 / 5.0.1 / 6.0.0。校验值和官方下载地址均在源码中，可直接审阅。SHA-256 用于确认下载内容符合固定版本，并不等于对核心实现做过完整安全审计。各运行组件保留各自许可证；本仓库管理代码采用 MIT。
+运行核心固定为 Realm 2.9.6、Xray 26.10.31、sing-box 1.14.4、Snell 4.1.1 / 5.0.1 / 6.0.0。校验值和官方下载地址均在源码中，可直接审阅。SHA-256 用于确认下载内容符合固定版本，并不等于对核心实现做过完整安全审计。各运行组件保留各自许可证；本仓库管理代码采用 MIT。
 
-从 0.2.0 更新：重新运行一键安装命令即可，已有的转发规则和节点照常沿用。
+从 0.2.0 或 0.3.0 更新：重新运行一键安装命令即可，已有的转发规则和节点照常沿用。
 
+- 0.3.1 改为固定 Xray 26.10.31（官方已撤回 26.10.29）。之后第一次修改节点或执行 `sudo relay node apply` 时，会自动下载新版并重启用到它的节点；在那之前节点继续用旧版运行。
 - 下一次增删转发规则或执行 `sudo relay apply` 时，`relay-kit-nft.service` 会自动更新：跟随 `nftables.service` 重启，并加上 MSS 钳制。
 - 下一次增删节点或执行 `sudo relay node apply` 时，会按需在主机防火墙放行节点端口。
 - 节点菜单编号有变化：3 是中转入口，修改、删除移到 4、5。主菜单新增"5) 核心组件"，卸载移到 6。

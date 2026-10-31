@@ -42,12 +42,12 @@ PROTOCOLS = {
     "tuic": ("TUIC v5", "sing-box", ("udp",), True),
     "naive": ("NaiveProxy", "sing-box", ("tcp", "udp"), True),
 }
-CORE_VERSIONS = {"xray": "26.10.29", "sing-box": "1.14.4",
+CORE_VERSIONS = {"xray": "26.10.31", "sing-box": "1.14.4",
                  "snell4": "4.1.1", "snell5": "5.0.1", "snell6": "6.0.0"}
 # Archives fetched from official publishers; fixed digests make replacement fail closed.
 CORE_DIGESTS = {
-    "xray": ("8a5f3e6a1057e4bd0f8a7c57c9d91204b4be0b74222a6e210d070603101163c2",
-             "afe01f19045b05237420328028ee1ee2e1edd2100eb41a8cbbf50e683b0a6e58"),
+    "xray": ("e4bd9119f50ae7c41658b1abd0679ae06f98bd864a2907ff33f2f2cf7081b214",
+             "1811c8f1da0c3b6dc707ebaf1c8390e987ba39859a8f0a7aadd8526157f2ec8d"),
     "sing-box": ("699a1b510aa4396b2176d32d1181920399ebf1e267835da6f3b598d0f7c24968",
                  "436441f76ee2f7fe21b5b2d426d3cb261a480455a704865789ad533e4273ec26"),
     "snell4": ("cc2271b79c7506888b34e651e8741b3aa7fc7d5f60aa65ef8bb096f3313a193b",
@@ -546,6 +546,9 @@ class NodeManager(Manager):
         validate_nodes(state)
         previous = self.load()
         self.check_ports(self.forwarding_shape(state), self.forwarding_shape(previous))
+        # After an upgrade pins a newer core, fetch it before validating configs with it.
+        for core in sorted({PROTOCOLS[node["kind"]][1] for node in state["nodes"] if node["enabled"]}):
+            self.install_core(core)
         self.runtime.mkdir(parents=True, exist_ok=True, mode=0o700)
         with tempfile.TemporaryDirectory(prefix=".check-", dir=self.runtime) as temporary:
             for node in state["nodes"]:

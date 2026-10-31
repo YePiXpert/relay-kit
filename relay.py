@@ -23,7 +23,7 @@ import time
 import urllib.request
 import urllib.parse
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 MARKER = "# relay-kit managed entry"
 REALM_VERSION = "2.9.6"
 REALM_ASSETS = {

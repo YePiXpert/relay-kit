@@ -15,7 +15,7 @@ if (( ${#missing[@]} )); then
 fi
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
-base=https://raw.githubusercontent.com/YePiXpert/relay-kit/v0.3.0
+base=https://raw.githubusercontent.com/YePiXpert/relay-kit/v0.3.1
 # Mirror prefixes are tried only after GitHub fails; the SHA-256 check below decides what is installed.
 prefixes=${RELAY_KIT_MIRRORS-https://ghfast.top/ https://gh-proxy.com/}
 read -r -a mirrors <<< "${prefixes//,/ }"
@@ -34,8 +34,8 @@ done
     cd "$work"
     sha256sum --check <<'SUMS'
 cc357f101e4823914620fcc00748870e5b35622a5ee00e0c5b4614ad74c6185e  forward.sh
-b0e3f7bb4e28428070426da53855f6b47bfbe2abdadd067faf03200deb29a398  relay.py
-e62f18b5ead554b3cb80936779adb34aa907c279e30c5add30d9269c5bc07dc7  nodes.py
+effc629780018875321d5641555e1c91be0f7df9c79063c2f7d292a4c06063c4  relay.py
+d8ff7ced6c22e66ef074ed5321a9f0db931e9acdef2a8ac51c598b28cd2d7f51  nodes.py
 7126582bbffcfb7aa5f48e5eb2bcf3d917ba26dc532d7ae29ec4ccb954ad08a2  menu.py
 SUMS
 )
