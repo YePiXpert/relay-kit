@@ -2,6 +2,7 @@
 
 import base64
 import copy
+import hashlib
 import io
 import ipaddress
 import json
@@ -17,8 +18,9 @@ import uuid
 import zipfile
 import tarfile
 
-from relay import (Manager, RelayError, atomic_write, download_verified, host, json_text,
-                   port, protocols, active_rules, run, valid_name, validate_state)
+from relay import (REALM_ASSETS, REALM_VERSION, Manager, RelayError, apply_firewall, atomic_write,
+                   download_verified, host, json_text, port, protocols, active_rules, realm_url, run,
+                   valid_name, validate_state)
 
 # name: (display name, official runtime, public transports, certificate required)
 PROTOCOLS = {
@@ -57,7 +59,7 @@ CORE_DIGESTS = {
 }
 SS_METHOD = "2022-blake3-aes-128-gcm"
 OPTION_KEYS = {"sni", "path", "cert", "key", "bind", "method", "mode", "dns", "obfs",
-               "fallback", "tls", "up_mbps", "down_mbps"}
+               "fallback", "tls", "up_mbps", "down_mbps", "relays"}
 SECRET_KEYS = {"uuid", "password", "private", "public", "short_id", "encryption", "decryption"}
 
 
@@ -68,6 +70,40 @@ def domain(value):
     except ValueError:
         return value
     raise RelayError("SNI 需要域名。")
+
+
+def core_url(core, machine):
+    arm, version = machine == "aarch64", CORE_VERSIONS[core]
+    if core == "xray":
+        return (f"https://github.com/XTLS/Xray-core/releases/download/v{version}/"
+                f"Xray-linux-{'arm64-v8a' if arm else '64'}.zip")
+    if core == "sing-box":
+        return (f"https://github.com/SagerNet/sing-box/releases/download/v{version}/"
+                f"sing-box-{version}-linux-{'arm64' if arm else 'amd64'}.tar.gz")
+    return f"https://dl.nssurge.com/snell/snell-server-v{version}-linux-{'aarch64' if arm else 'amd64'}.zip"
+
+
+def official_assets():
+    """Every pinned download as (core, version, machine, url, sha256)."""
+    assets = [("realm", REALM_VERSION, machine, realm_url(arch), digest)
+              for machine, (arch, digest) in REALM_ASSETS.items()]
+    for core, digests in CORE_DIGESTS.items():
+        for machine, digest in zip(("x86_64", "aarch64"), digests):
+            assets.append((core, CORE_VERSIONS[core], machine, core_url(core, machine), digest))
+    return assets
+
+
+def next_label(relays):
+    labels, index = {item["label"] for item in relays}, len(relays) + 1
+    while f"中转{index}" in labels:
+        index += 1
+    return f"中转{index}"
+
+
+def check_label(value):
+    if not re.fullmatch(r"[^\s,=#\"'\\]{1,24}", value):
+        raise RelayError("名称为 1–24 个字符，不能包含空白、逗号、等号、# 或引号。")
+    return value
 
 
 def node_protocols(node):
@@ -143,6 +179,16 @@ def validate_nodes(state):
         for name in ("up_mbps", "down_mbps"):
             if name in opts and (type(opts[name]) is not int or not 1 <= opts[name] <= 100000):
                 raise RelayError("Hysteria2 带宽需为 1–100000 Mbps。")
+        relays = opts.get("relays", [])
+        if not isinstance(relays, list) or len(relays) > 8:
+            raise RelayError("每个节点最多保存 8 个中转入口。")
+        for item in relays:
+            if (not isinstance(item, dict) or set(item) != {"address", "port", "label"} or
+                    type(item["port"]) is not int or not isinstance(item["label"], str)):
+                raise RelayError("中转入口格式错误。")
+            host(item["address"])
+            port(item["port"])
+            check_label(item["label"])
         if not isinstance(keys.get("password"), str) or not re.fullmatch(r"[A-Za-z0-9_+/=-]{16,256}", keys["password"]):
             raise RelayError("节点凭据格式错误。")
         uuid.UUID(keys.get("uuid", ""))
@@ -256,16 +302,17 @@ def snell_config(node):
     return "\n".join(lines) + "\n"
 
 
-def node_link(node):
+def node_link(node, title=None):
     opts, keys, kind = node["options"], node["secrets"], node["kind"]
     address = f"[{node['address']}]" if ":" in node["address"] else node["address"]
     endpoint = f"{address}:{node['listen']}"
     quote = lambda text: urllib.parse.quote(str(text), safe="")
-    label, password = quote(node["name"]), quote(keys["password"])
+    title = title or node["name"]
+    label, password = quote(title), quote(keys["password"])
     sni = opts.get("sni", node["address"])
     if kind.startswith("snell"):
         version = kind[-1]
-        result = f"{node['name']} = snell, {node['address']}, {node['listen']}, psk={keys['password']}, version={version}, tfo=true"
+        result = f"{title} = snell, {node['address']}, {node['listen']}, psk={keys['password']}, version={version}, tfo=true"
         if version == "6":
             result += ", mode=" + opts.get("mode", "default")
         elif opts.get("obfs") == "http":
@@ -279,7 +326,7 @@ def node_link(node):
     if kind == "naive":
         return f"naive+https://{quote(node['name'])}:{password}@{endpoint}#{label}"
     if kind == "vmess-ws":
-        value = {"v": "2", "ps": node["name"], "add": node["address"], "port": str(node["listen"]),
+        value = {"v": "2", "ps": title, "add": node["address"], "port": str(node["listen"]),
                  "id": keys["uuid"], "aid": "0", "scy": "auto", "net": "ws", "type": "none",
                  "host": sni, "path": opts.get("path", "/relay"),
                  "tls": "tls" if opts.get("tls") else "", "sni": sni}
@@ -306,6 +353,16 @@ def node_link(node):
         else:
             params["flow"] = "xtls-rprx-vision"
     return f"vless://{keys['uuid']}@{endpoint}?{urllib.parse.urlencode(params)}#{label}"
+
+
+def relayed(node, address, listen=None):
+    """The node as clients reach it through a relay entry such as Po0: same protocol, new endpoint."""
+    if node["kind"] == "naive":
+        raise RelayError("NaiveProxy 会校验证书域名，不能改用中转 IP；请把域名解析到中转机后使用原链接。")
+    via = copy.deepcopy(node)
+    via["options"].setdefault("sni", node["address"])
+    via.update(address=host(address), listen=port(listen or node["listen"]))
+    return via
 
 
 class NodeManager(Manager):
@@ -362,31 +419,23 @@ class NodeManager(Manager):
         self.runtime.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.runtime.chmod(0o700)
 
-    def install_core(self, core):
+    def install_core(self, core, data=None):
+        """Install a pinned core, downloading it unless an imported archive is given."""
         self.library.mkdir(parents=True, exist_ok=True, mode=0o755)
         self.library.chmod(0o755)
         destination = self.binary(core)
-        if (destination.is_file() and not destination.is_symlink() and
-                (core != "sing-box" or (self.library / "libcronet.so").is_file())):
+        if data is None and (destination.is_file() and not destination.is_symlink() and
+                             (core != "sing-box" or (self.library / "libcronet.so").is_file())):
             return
         arch = platform.machine()
         if arch not in ("x86_64", "aarch64"):
             raise RelayError("固定节点核心支持 x86_64 / aarch64。")
         arm, version = arch == "aarch64", CORE_VERSIONS[core]
-        digest = CORE_DIGESTS[core][int(arm)]
-        if core == "xray":
-            filename = "Xray-linux-" + ("arm64-v8a" if arm else "64") + ".zip"
-            url = f"https://github.com/XTLS/Xray-core/releases/download/v{version}/{filename}"
-            member = "xray"
-        elif core == "sing-box":
-            stem = f"sing-box-{version}-linux-" + ("arm64" if arm else "amd64")
-            url = f"https://github.com/SagerNet/sing-box/releases/download/v{version}/{stem}.tar.gz"
-            member = stem + "/sing-box"
-        else:
-            url = f"https://dl.nssurge.com/snell/snell-server-v{version}-linux-" + ("aarch64" if arm else "amd64") + ".zip"
-            member = "snell-server"
-        print(f"下载官方 {core} {version} 并校验 SHA-256。", flush=True)
-        data = download_verified(url, digest, 128 * 1024 * 1024)
+        stem = f"sing-box-{version}-linux-" + ("arm64" if arm else "amd64")
+        member = {"xray": "xray", "sing-box": stem + "/sing-box"}.get(core, "snell-server")
+        if data is None:
+            print(f"下载官方 {core} {version} 并校验 SHA-256。", flush=True)
+            data = download_verified(core_url(core, arch), CORE_DIGESTS[core][int(arm)], 128 * 1024 * 1024)
         if core == "sing-box":
             with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
                 item = archive.getmember(member)
@@ -404,6 +453,30 @@ class NodeManager(Manager):
                     raise RelayError("核心压缩包格式错误。")
                 binary = archive.read(item)
         atomic_write(destination, binary, 0o755)
+
+    def import_archive(self, path):
+        """Install a pinned runtime from an uploaded official archive; returns its name and version."""
+        path = pathlib.Path(path)
+        if not path.is_file() or path.stat().st_size > 256 * 1024 * 1024:
+            raise RelayError(f"找不到文件，或文件超过 256 MB：{path}")
+        data = path.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        match = next((asset for asset in official_assets() if asset[4] == digest), None)
+        if not match:
+            raise RelayError(f"{path.name} 不是 Relay Kit 固定版本的官方压缩包（SHA-256 不匹配），未导入。")
+        core, version, machine = match[:3]
+        if machine != platform.machine():
+            raise RelayError(f"{path.name} 是 {machine} 版本，本机是 {platform.machine()}。")
+        if core == "realm":
+            self.install_realm(data)
+        else:
+            self.install_core(core, data)
+        return f"{core} {version}"
+
+    def cores(self):
+        """(name, version, installed) for every pinned runtime."""
+        return [("realm", REALM_VERSION, self.realm.is_file())] + [
+            (core, version, self.binary(core).is_file()) for core, version in CORE_VERSIONS.items()]
 
     def render(self, node):
         core = PROTOCOLS[node["kind"]][1]
@@ -496,6 +569,7 @@ class NodeManager(Manager):
                 self.config_path(node).unlink(missing_ok=True)
                 (self.units / self.unit(node)).unlink(missing_ok=True)
         run("systemctl", "daemon-reload")
+        apply_firewall(self.root)
 
     def new_secrets(self, kind):
         values = {"uuid": str(uuid.uuid4()), "password": secrets.token_urlsafe(24)}
@@ -532,16 +606,13 @@ class NodeManager(Manager):
         node["secrets"] = self.new_secrets(kind)
         state["nodes"].append(node)
         self.commit(state)
-        print("节点已创建。连接信息（含凭据）：\n" + node_link(node))
+        return node
 
     def change(self, action, name, changes=None):
         state = copy.deepcopy(self.load())
         node = next((n for n in state["nodes"] if n["name"] == name), None)
         if not node:
-            raise RelayError("节点不存在。")
-        if action == "link":
-            print(node_link(node))
-            return
+            raise RelayError(f"未找到节点：{name}")
         if action == "del":
             state["nodes"].remove(node)
         elif action == "set":
@@ -558,6 +629,8 @@ class NodeManager(Manager):
 
 
 def show_nodes(state):
+    if not state["nodes"]:
+        print("暂无节点。")
     for node in state["nodes"]:
         print(f"{node['name']:<16} {PROTOCOLS[node['kind']][0]:<25} "
               f"{node['address']}:{node['listen']}  {'启用' if node['enabled'] else '停用'}")

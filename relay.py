@@ -6,6 +6,7 @@ import contextlib
 import copy
 import fcntl
 import hashlib
+import http.client
 import io
 import ipaddress
 import json
@@ -22,7 +23,7 @@ import time
 import urllib.request
 import urllib.parse
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 MARKER = "# relay-kit managed entry"
 REALM_VERSION = "2.9.6"
 REALM_ASSETS = {
@@ -31,6 +32,14 @@ REALM_ASSETS = {
 }
 TABLE = "relay_kit"
 UNITS = {"nft": "relay-kit-nft.service", "realm": "relay-kit-realm.service"}
+# TCP MSS for forwarded connections; the Po0 Wiki clamps to 1452 to avoid stalls on lower-MTU paths.
+MSS = 1452
+# Blocked in both directions by default on Po0 Guangzhou/East China BGP entries.
+BLOCKED_PORTS = (80, 443, 8080, 8443, 8000, 1080)
+# Prefixes for GitHub downloads, tried only after a direct download fails. Pinned SHA-256
+# digests decide what is accepted, so a mirror can make a download fail but not change it.
+MIRRORS = ("https://ghfast.top/", "https://gh-proxy.com/")
+FIREWALL_TAG = "relay-kit"
 
 
 class RelayError(Exception):
@@ -147,7 +156,202 @@ def nft_config(state):
         for proto in protocols(rule):
             lines.append(f"  ct status dnat ct original proto-dst {rule['listen']} ip daddr "
                          f"{rule['host']} {proto} dport {rule['remote']} counter masquerade")
+    lines += [" }", " chain forward {", "  type filter hook forward priority mangle; policy accept;"]
+    tcp = sorted({rule["listen"] for rule in rules if rule["proto"] != "udp"})
+    if tcp:
+        # Lower, never raise, the MSS of SYN and SYN-ACK in both directions of our connections.
+        lines.append(f"  ct status dnat ct original proto-dst {{ {', '.join(map(str, tcp))} }} "
+                     f"tcp flags & (syn | rst) == syn tcp option maxseg size > {MSS} counter "
+                     f"tcp option maxseg size set {MSS}")
     return "\n".join(lines + [" }", "}", ""])
+
+
+def blocked_port_note(*numbers):
+    hits = sorted({int(number) for number in numbers if str(number).isdigit() and int(number) in BLOCKED_PORTS})
+    if hits:
+        return (f"端口 {'、'.join(map(str, hits))} 在 Po0 广州/华东 BGP 等国内入口默认双向封禁；"
+                "链路经过这类入口时请换端口。")
+    return None
+
+
+def foreign_forwards(ruleset):
+    """(proto, low, high, table) port ranges that other nftables tables DNAT or redirect."""
+    found, table = [], None
+    for line in ruleset.splitlines():
+        head = re.match(r"\s*table (\S+) (\S+) \{", line)
+        if head:
+            table = head.groups()
+            continue
+        if not table or table == ("ip", TABLE) or not re.search(r"\b(dnat|redirect)\b", line):
+            continue
+        for proto, values in re.findall(r"\b(tcp|udp|th) dport (?:map )?(\{[^}]*\}|\d+(?:-\d+)?)", line):
+            for element in values.strip("{}").split(","):
+                match = re.fullmatch(r"\s*(\d+)(?:-(\d+))?\s*(?::.*)?", element)
+                if match:
+                    for name in ("tcp", "udp") if proto == "th" else (proto,):
+                        found.append((name, int(match[1]), int(match[2] or match[1]), " ".join(table)))
+    return found
+
+
+def forward_blockers(ruleset):
+    """Forward-hook chains of other tables that drop whatever they do not accept (Docker, ufw, firewalld)."""
+    chains, table, chain, depth = {}, None, None, 0
+    for line in ruleset.splitlines():
+        text = line.strip()
+        if depth == 0 and text.startswith("table "):
+            table = " ".join(text.split()[1:3])
+        elif depth == 1 and text.startswith("chain "):
+            chain = (table, text.split()[1])
+            chains[chain] = []
+        elif depth >= 2 and chain:
+            chains[chain].append(text)
+        depth += text.count("{") - text.count("}")
+        if depth <= 1:
+            chain = None
+    blockers = []
+    for (name, chain), lines in chains.items():
+        rules = [text for text in lines[1:] if text and text != "}"]
+        if name == f"ip {TABLE}" or not lines or "hook forward" not in lines[0]:
+            continue
+        last = rules[-1] if rules else ""
+        if "policy drop" in lines[0] or re.fullmatch(r"(counter packets \d+ bytes \d+ )?(drop|reject\b.*)", last):
+            blockers.append(f"{name} {chain}")
+    return blockers
+
+
+def forward_drop_note():
+    blockers = forward_blockers(run("nft", "list", "ruleset", check=False).stdout) if shutil.which("nft") else []
+    if blockers:
+        return (f"{'、'.join(blockers)} 默认丢弃转发流量（常见于 Docker、ufw、firewalld），nftables 转发的连接会被丢弃。"
+                "可以改用 Realm 引擎，或在该防火墙中放行（ufw route allow、Docker 的 DOCKER-USER 链）。")
+    return None
+
+
+def input_block(tool):
+    """Where ACCEPT rules must go in INPUT (1-based), or None when INPUT does not reject by default."""
+    if not shutil.which(tool):
+        return None
+    rules = run(tool, "-S", "INPUT", check=False).stdout.splitlines()
+    appended = [rule for rule in rules if rule.startswith("-A INPUT ")]
+    for index, rule in enumerate(appended, 1):
+        if re.fullmatch(r"-A INPUT -j (REJECT|DROP)( --reject-with \S+)?", rule):
+            return index
+    return len(appended) + 1 if "-P INPUT DROP" in rules else None
+
+
+def firewall_backend():
+    """The active host firewall that would block Relay Kit's listeners, if any."""
+    if shutil.which("ufw") and run("ufw", "status", check=False).stdout.startswith("Status: active"):
+        return "ufw"
+    if shutil.which("firewall-cmd") and run("firewall-cmd", "--state", check=False).stdout.strip() == "running":
+        return "firewalld"
+    if any(input_block(tool) for tool in ("iptables", "ip6tables")):
+        return "iptables"
+    return None
+
+
+def accept_rule(proto, number):
+    return ["-p", proto, "--dport", str(number), "-m", "comment", "--comment", FIREWALL_TAG, "-j", "ACCEPT"]
+
+
+def firewall_allow(backend, proto, number):
+    """Open one port; True when Relay Kit added the rule rather than finding it already open."""
+    spec = f"{number}/{proto}"
+    if backend == "ufw":
+        return "Skipping" not in run("ufw", "allow", spec, "comment", FIREWALL_TAG).stdout
+    if backend == "firewalld":
+        result = run("firewall-cmd", "--permanent", f"--add-port={spec}")
+        run("firewall-cmd", f"--add-port={spec}", check=False)
+        return "ALREADY_ENABLED" not in result.stdout + result.stderr
+    for tool in ("iptables", "ip6tables"):
+        position = input_block(tool)
+        if position and run(tool, "-C", "INPUT", *accept_rule(proto, number), check=False).returncode:
+            run(tool, "-I", "INPUT", str(position), *accept_rule(proto, number))
+    return True
+
+
+def firewall_remove(backend, proto, number):
+    spec = f"{number}/{proto}"
+    if backend == "ufw":
+        run("ufw", "--force", "delete", "allow", spec, check=False)
+    elif backend == "firewalld":
+        run("firewall-cmd", "--permanent", f"--remove-port={spec}", check=False)
+        run("firewall-cmd", f"--remove-port={spec}", check=False)
+    elif backend == "iptables":
+        for tool in ("iptables", "ip6tables"):
+            while shutil.which(tool) and not run(tool, "-C", "INPUT", *accept_rule(proto, number), check=False).returncode:
+                run(tool, "-D", "INPUT", *accept_rule(proto, number))
+
+
+def firewall_record(path):
+    record = json.loads(path.read_text()) if path.exists() else {"backend": None, "ports": []}
+    if (not isinstance(record, dict) or record.get("backend") not in (None, "ufw", "firewalld", "iptables") or
+            not isinstance(record.get("ports"), list) or
+            any(not isinstance(item, list) or len(item) != 2 or item[0] not in ("tcp", "udp") or
+                type(item[1]) is not int for item in record["ports"])):
+        raise RelayError("防火墙放行记录格式错误。")
+    return record["backend"], {(proto, number) for proto, number in record["ports"]}
+
+
+def listening_ports(root):
+    """(proto, port) pairs Relay Kit services accept on this host: enabled nodes and Realm entries."""
+    manager = Manager(root)
+    wanted = manager.reserved_ports()
+    if manager.state_file.exists():
+        state = manager.load()
+        if state["engine"] == "realm":
+            wanted |= {(proto, rule["listen"]) for rule in active_rules(state) for proto in protocols(rule)}
+    return wanted
+
+
+def sync_firewall(root, wanted=None):
+    """Open the active host firewall for Relay Kit's listeners and close what it opened before.
+
+    Only rules Relay Kit added are recorded, so rules the user had already are never removed.
+    Passing `wanted` (as uninstall does) skips detection and works on the recorded firewall."""
+    path = Manager(root).directory / "firewall.json"
+    previous, before = firewall_record(path)
+    backend = firewall_backend() if wanted is None else previous
+    opened, messages = set(before), []
+
+    def attempt(action, name, proto, number):
+        try:
+            return action(name, proto, number)
+        except RelayError as error:
+            messages.append(f"{name} 处理 {number}/{proto} 失败：{error}")
+            return False
+
+    if previous and previous != backend:
+        for proto, number in sorted(opened):
+            attempt(firewall_remove, previous, proto, number)
+        opened = set()
+    if wanted is None:
+        wanted = listening_ports(root) if backend else set()
+    for proto, number in sorted(wanted - opened):
+        if attempt(firewall_allow, backend, proto, number):
+            opened.add((proto, number))
+            messages.append(f"已在 {backend} 放行 {number}/{proto}")
+    for proto, number in sorted(opened - wanted):
+        attempt(firewall_remove, backend, proto, number)
+        opened.discard((proto, number))
+        messages.append(f"已在 {backend} 关闭 {number}/{proto}")
+    if messages and "iptables" in (backend, previous):
+        if shutil.which("netfilter-persistent"):
+            run("netfilter-persistent", "save", check=False)
+        else:
+            messages.append("未安装 netfilter-persistent，iptables 放行规则重启后会失效")
+    if (backend if opened else None, opened) != (previous, before):
+        atomic_write(path, json_text({"backend": backend if opened else None,
+                                      "ports": [list(item) for item in sorted(opened)]}))
+    return messages
+
+
+def apply_firewall(root):
+    try:
+        for message in sync_firewall(root):
+            print("防火墙：" + message, flush=True)
+    except (RelayError, ValueError, OSError) as error:
+        print(f"提示：自动放行防火墙失败，请手动放行端口：{error}", file=sys.stderr)
 
 
 def realm_config(state):
@@ -161,15 +365,41 @@ def realm_config(state):
     return {"log": {"level": "warn", "output": "stderr"}, "endpoints": endpoints}
 
 
-def download_verified(url, digest, limit=32 * 1024 * 1024):
+def mirrors():
+    value = os.environ.get("RELAY_KIT_MIRRORS")
+    return MIRRORS if value is None else tuple(item for item in re.split(r"[\s,]+", value) if item)
+
+
+def fetch(url, limit):
     request = urllib.request.Request(url, headers={"User-Agent": "Relay-Kit/" + VERSION})
-    with urllib.request.urlopen(request, timeout=60) as response:
+    with urllib.request.urlopen(request, timeout=30) as response:
         if not response.url.startswith("https://"):
             raise RelayError("下载被重定向到了非 HTTPS 地址。")
-        data = response.read(limit + 1)
-    if len(data) > limit or hashlib.sha256(data).hexdigest() != digest:
-        raise RelayError("下载内容大小或 SHA-256 校验失败，未执行下载文件。")
-    return data
+        return response.read(limit + 1)
+
+
+def download_verified(url, digest, limit=32 * 1024 * 1024):
+    sources = [url] + [prefix + url for prefix in mirrors() if url.startswith("https://github.com/")]
+    problems = []
+    for source in sources:
+        site = urllib.parse.urlsplit(source).netloc
+        if source != url:
+            print(f"改用镜像 {site} 下载，内容同样校验 SHA-256。", flush=True)
+        try:
+            data = fetch(source, limit)
+        except (OSError, ValueError, http.client.HTTPException, RelayError) as error:
+            problems.append(f"{site}：{error}")
+            continue
+        if len(data) <= limit and hashlib.sha256(data).hexdigest() == digest:
+            return data
+        problems.append(f"{site}：大小或 SHA-256 校验失败，已丢弃")
+    raise RelayError("下载失败，未使用任何下载内容：\n" + "\n".join(problems) +
+                     f"\n离线安装：在能访问该地址的电脑上下载\n{url}\n上传到服务器后运行 sudo relay core import 文件路径")
+
+
+def realm_url(arch):
+    return (f"https://github.com/zhboner/realm/releases/download/v{REALM_VERSION}/"
+            f"realm-{arch}-unknown-linux-musl.tar.gz")
 
 
 class Manager:
@@ -207,28 +437,35 @@ class Manager:
             run("apt-get", "update")
             run("apt-get", "install", "-y", *missing)
         if engine == "realm" and not self.realm.exists():
-            try:
-                arch, digest = REALM_ASSETS[platform.machine()]
-            except KeyError:
-                raise RelayError("Realm 固定版本支持 x86_64 / aarch64。") from None
-            url = (f"https://github.com/zhboner/realm/releases/download/v{REALM_VERSION}/"
-                   f"realm-{arch}-unknown-linux-musl.tar.gz")
-            print(f"下载官方 Realm {REALM_VERSION} 并校验 SHA-256。", flush=True)
-            data = download_verified(url, digest)
-            with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
-                member = archive.getmember("realm")
-                if not member.isfile() or member.size > 32 * 1024 * 1024:
-                    raise RelayError("Realm 压缩包内容无效。")
-                atomic_write(self.realm, archive.extractfile(member).read(), 0o755)
-            run(self.realm, "--version")
+            self.install_realm()
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o755)
         self.directory.chmod(0o755)
         self.library.mkdir(parents=True, exist_ok=True, mode=0o755)
         self.library.chmod(0o755)
         self.write_units()
 
+    def install_realm(self, data=None):
+        """Install the pinned Realm binary, downloading it unless an imported archive is given."""
+        try:
+            arch, digest = REALM_ASSETS[platform.machine()]
+        except KeyError:
+            raise RelayError("Realm 固定版本支持 x86_64 / aarch64。") from None
+        if data is None:
+            print(f"下载官方 Realm {REALM_VERSION} 并校验 SHA-256。", flush=True)
+            data = download_verified(realm_url(arch), digest)
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
+            member = archive.getmember("realm")
+            if not member.isfile() or member.size > 32 * 1024 * 1024:
+                raise RelayError("Realm 压缩包内容无效。")
+            atomic_write(self.realm, archive.extractfile(member).read(), 0o755)
+        run(self.realm, "--version")
+
     def write_units(self):
-        common = "[Unit]\nDescription=Relay Kit {engine}\nWants=network-online.target\nAfter=network-online.target nftables.service\n\n"
+        common = ("[Unit]\nDescription=Relay Kit {engine}\nWants=network-online.target\n"
+                  "After=network-online.target nftables.service\n{extra}\n")
+        # Debian's nftables.service flushes the whole ruleset when it stops, and the Po0 Wiki's
+        # /etc/nftables.conf starts with `flush ruleset`; re-apply our table after either.
+        follow = "PartOf=nftables.service\nReloadPropagatedFrom=nftables.service\n"
         nft = ("[Service]\nType=oneshot\nRemainAfterExit=yes\n"
                "ExecStartPre=/usr/sbin/sysctl -q -w net.ipv4.ip_forward=1\n"
                f"ExecStart=/usr/sbin/nft -f {self.directory}/nftables.nft\n"
@@ -238,15 +475,22 @@ class Manager:
                  "Restart=on-failure\nRestartSec=3\nDynamicUser=yes\n"
                  "AmbientCapabilities=CAP_NET_BIND_SERVICE\nCapabilityBoundingSet=CAP_NET_BIND_SERVICE\n"
                  "NoNewPrivileges=yes\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nLimitNOFILE=65536\n")
-        for engine, body in (("nft", nft), ("realm", realm)):
-            atomic_write(self.units / UNITS[engine], common.format(engine=engine) + body +
-                         "\n[Install]\nWantedBy=multi-user.target\n", 0o644)
-        run("systemctl", "daemon-reload")
+        changed = False
+        for engine, extra, body, wanted in (("nft", follow, nft, "multi-user.target nftables.service"),
+                                           ("realm", "", realm, "multi-user.target")):
+            path = self.units / UNITS[engine]
+            text = common.format(engine=engine, extra=extra) + body + f"\n[Install]\nWantedBy={wanted}\n"
+            if not path.is_file() or path.read_text() != text:
+                atomic_write(path, text, 0o644)
+                changed = True
+        if changed:
+            run("systemctl", "daemon-reload")
 
     def check_ports(self, state, previous):
         occupied = self.reserved_ports()
         existing = {(proto, rule["listen"]) for rule in active_rules(previous)
                     for proto in protocols(rule)} if previous else set()
+        foreign = foreign_forwards(run("nft", "list", "ruleset", check=False).stdout) if shutil.which("nft") else []
         for rule in active_rules(state):
             for proto in protocols(rule):
                 listen = rule["listen"]
@@ -254,6 +498,10 @@ class Manager:
                     raise RelayError(f"端口与另一模块的规则冲突：{proto}/{listen}")
                 if proto == "tcp" and (listen == 22 or str(listen) == os.environ.get("SSH_CONNECTION", "").split(" ")[-1]):
                     raise RelayError("入口端口与 SSH 端口冲突。")
+                clash = next((table for name, low, high, table in foreign if name == proto and low <= listen <= high), None)
+                if clash and (proto, listen) not in existing:
+                    raise RelayError(f"端口 {proto}/{listen} 已被 nftables 表 {clash} 中的其他规则转发；请先删除旧规则"
+                                     "（例如按 Po0 Wiki 手写的 /etc/nftables.conf），只用一套工具管理转发。")
                 result = run("ss", "-H", "-lntp" if proto == "tcp" else "-lnup", f"sport = :{listen}")
                 if result.stdout.strip():
                     pids = set(re.findall(r"pid=(\d+),", result.stdout))
@@ -279,6 +527,7 @@ class Manager:
 
     def sync(self, state):
         engine = state["engine"]
+        self.write_units()
         self.write_configs(state)
         other = "realm" if engine == "nft" else "nft"
         run("systemctl", "disable", "--now", UNITS[other])
@@ -327,6 +576,10 @@ class Manager:
             except Exception as rollback:
                 raise RelayError(f"应用失败：{error}\n回退也失败：{rollback}\n请检查备份及服务日志。") from error
             raise
+        apply_firewall(self.root)
+        hint = forward_drop_note() if state["engine"] == "nft" and active_rules(state) else None
+        if hint:
+            print("提示：" + hint, file=sys.stderr)
 
     def init(self, engine):
         state = self.load() if self.state_file.exists() else {"engine": engine, "rules": []}
@@ -344,7 +597,7 @@ class Manager:
             state["rules"].append({"name": name, "proto": proto, "listen": port(listen),
                                    "host": target, "remote": port(remote), "enabled": True})
         elif not match:
-            raise RelayError("未找到该规则。")
+            raise RelayError(f"未找到规则：{name}")
         elif action == "set":
             match.update(proto=proto, listen=port(listen), host=target, remote=port(remote))
         elif action == "del":
@@ -369,7 +622,7 @@ def install_self(launcher):
     if MARKER not in source.read_text().splitlines():
         raise RelayError("入口脚本标记不匹配。")
     payloads = [(destination, module.read_bytes(), 0o644)]
-    for filename in ("nodes.py",):
+    for filename in ("nodes.py", "menu.py"):
         companion = module.parent / filename
         output = library / filename
         if output.is_symlink() or (output.exists() and not output.read_text().startswith('"""Relay Kit:')):
@@ -396,79 +649,13 @@ def install_self(launcher):
     print(f"Relay Kit {VERSION} 已安装。运行 sudo relay 打开菜单。")
 
 
-def node_menu(manager):
-    from nodes import PROTOCOLS
-    while True:
-        print("\n节点管理\n1) 添加节点  2) 查看节点  3) 导出连接信息\n"
-              "4) 删除节点  5) 启用节点  6) 停用节点  7) 修改端口/密钥\n"
-              "8) 查看状态  9) 查看日志  0) 返回")
-        try:
-            choice = input("请选择：").strip()
-            if choice == "0":
-                return
-            require_root()
-            with manager.lock():
-                if choice == "1":
-                    kinds = list(PROTOCOLS)
-                    for index, kind in enumerate(kinds, 1):
-                        print(f"{index}) {PROTOCOLS[kind][0]}")
-                    selected = int(input("协议编号："))
-                    if not 1 <= selected <= len(kinds):
-                        raise RelayError("协议编号无效。")
-                    kind = kinds[selected - 1]
-                    name = input("节点名称：").strip()
-                    listen = input("监听端口：").strip()
-                    address = input("服务器公网 IP/域名（用于分享链接）：").strip()
-                    options = {}
-                    if ":" in address:
-                        options["bind"] = "::"
-                    if kind.startswith("reality"):
-                        options["sni"] = input("REALITY 目标网站域名（支持 TLS 1.3，443 端口）：").strip()
-                    tls = PROTOCOLS[kind][3]
-                    if kind == "vmess-ws":
-                        tls = input("启用 TLS？[Y/n]：").strip().lower() != "n"
-                        options["tls"] = tls
-                    if tls:
-                        options["sni"] = input("证书域名 / SNI：").strip()
-                        if input("证书：1) 使用现有证书  2) 申请 Let's Encrypt [1]：").strip() == "2":
-                            email = input("证书联系邮箱：").strip()
-                            cert, key = certificate(options["sni"], email)
-                            options.update(cert=cert, key=key)
-                        else:
-                            options["cert"] = input("证书 PEM 绝对路径：").strip()
-                            options["key"] = input("私钥 PEM 绝对路径：").strip()
-                    if kind.endswith("-ws") or kind == "reality-xhttp":
-                        options["path"] = input("传输路径 [/relay]：").strip() or "/relay"
-                    manager.add(kind, name, listen, address, options)
-                elif choice == "2":
-                    show_nodes(manager.load())
-                elif choice in ("3", "4", "5", "6"):
-                    manager.change({"3": "link", "4": "del", "5": "enable", "6": "disable"}[choice],
-                                   input("节点名称：").strip())
-                elif choice == "7":
-                    name = input("节点名称：").strip()
-                    changes = {}
-                    listen = input("新端口（留空保留）：").strip()
-                    if listen:
-                        changes["listen"] = listen
-                    if input("重新生成凭据？[y/N]：").strip().lower() == "y":
-                        changes["rotate"] = True
-                    manager.change("set", name, changes)
-                elif choice in ("8", "9"):
-                    node_service_info(manager, "status" if choice == "8" else "logs",
-                                      input("节点名称（留空查看全部）：").strip())
-                else:
-                    print("无效选项。")
-        except EOFError:
-            return
-        except (RelayError, ValueError, OSError) as error:
-            print(f"错误：{error}", file=sys.stderr)
-
-
 def node_service_info(manager, action, name=None):
-    selected = [node for node in manager.load()["nodes"] if not name or node["name"] == name]
+    nodes = manager.load()["nodes"]
+    if not nodes:
+        raise RelayError("暂无节点，请先添加节点。")
+    selected = [node for node in nodes if not name or node["name"] == name]
     if not selected:
-        raise RelayError("未找到节点。")
+        raise RelayError(f"未找到节点：{name}")
     for node in selected:
         if action == "status":
             print(run("systemctl", "status", "--no-pager", manager.unit(node), check=False).stdout)
@@ -483,7 +670,7 @@ def bbr(manager, action):
     if action == "status":
         for key in keys:
             print(key + " = " + run("sysctl", "-n", key).stdout.strip())
-        return
+        return None
     require_root()
     marker = "# Relay Kit BBR\n"
     if config.is_symlink() or (config.exists() and not config.read_text().startswith(marker)):
@@ -519,16 +706,44 @@ def bbr(manager, action):
         for key, value in current.items():
             run("sysctl", "-q", "-w", key + "=" + value, check=False)
         raise
-    print("BBR 已启用（fq + bbr）。" if action == "on" else "已恢复启用 BBR 前的设置。")
+    return "BBR 已启用（fq + bbr）。" if action == "on" else "已恢复启用 BBR 前的设置。"
 
 
-def bbr_menu(manager):
-    print("\nBBR：1) 查看状态  2) 启用  3) 恢复原设置  0) 返回")
-    choice = input("请选择：").strip()
-    if choice in ("1", "2", "3"):
-        require_root()
-        with manager.lock():
-            bbr(manager, {"1": "status", "2": "on", "3": "off"}[choice])
+def uninstall(manager):
+    """Remove every service, file and setting Relay Kit created; leave anything it does not own."""
+    require_root()
+    owned = [path for path in sorted(manager.units.glob("relay-node-*.service"))
+             if path.is_file() and not path.is_symlink() and
+             path.read_text().startswith("# Relay Kit managed node\n")]
+    owned += [manager.units / name for name in UNITS.values() if (manager.units / name).is_file()]
+    if shutil.which("systemctl"):
+        for path in owned:
+            run("systemctl", "disable", "--now", path.name, check=False)
+    if shutil.which("nft"):
+        run("nft", "delete", "table", "ip", TABLE, check=False)
+    if (manager.directory / "bbr.json").exists():
+        try:
+            bbr(manager, "off")
+        except RelayError as error:
+            print(f"未能恢复 BBR 原设置：{error}")
+    marked = ((manager.root / "etc/sysctl.d/99-relay-kit-bbr.conf", "# Relay Kit BBR"),
+              (manager.root / "etc/letsencrypt/renewal-hooks/deploy/relay-kit", "# Relay Kit certificate reload"),
+              (manager.root / "usr/local/bin/relay", MARKER))
+    for path, marker in marked:
+        if path.is_file() and not path.is_symlink() and marker in path.read_text().splitlines():
+            owned.append(path)
+    for path in owned:
+        path.unlink(missing_ok=True)
+    try:
+        for message in sync_firewall(manager.root, wanted=set()):
+            print("防火墙：" + message)
+    except (RelayError, ValueError, OSError) as error:
+        print(f"未能撤销防火墙放行，请手动检查：{error}")
+    for directory in (manager.directory, manager.library):
+        if directory.is_dir() and not directory.is_symlink():
+            shutil.rmtree(directory)
+    if shutil.which("systemctl"):
+        run("systemctl", "daemon-reload", check=False)
 
 
 def certificate(name, email):
@@ -555,76 +770,13 @@ def certificate(name, email):
     return cert, key
 
 
-def top_menu(manager):
-    while True:
-        print(f"\nRelay Kit {VERSION}\n1) nftables 转发\n2) Realm 转发\n3) 搭建/管理节点\n4) BBR\n0) 退出")
-        try:
-            choice = input("请选择：").strip()
-        except EOFError:
-            return
-        if choice == "0":
-            return
-        if choice in ("1", "2"):
-            menu(manager, "nft" if choice == "1" else "realm")
-        elif choice == "3":
-            node_menu(NodeManager(manager.root))
-        elif choice == "4":
-            try:
-                bbr_menu(manager)
-            except (RelayError, ValueError, OSError) as error:
-                print(f"错误：{error}", file=sys.stderr)
-        else:
-            print("无效选项。")
-
-
 def show_rules(state):
     print(f"当前引擎：{state['engine']}")
+    if not state["rules"]:
+        print("暂无规则。")
     for rule in state["rules"]:
         print(f"{rule['name']:<20} {rule['proto']:<5} {rule['listen']} -> "
               f"{rule['host']}:{rule['remote']}  {'启用' if rule['enabled'] else '停用'}")
-
-
-def ask_rule():
-    return [input(prompt).strip() for prompt in
-            ("名称：", "协议 tcp/udp/both：", "入口端口：", "目标 IP/域名：", "目标端口：")]
-
-
-def menu(manager, selected=None):
-    while True:
-        print(f"\nRelay Kit {VERSION} — 自有转发管理")
-        if selected:
-            print(f"初始化时选用：{selected}")
-        print("1) 初始化/切换引擎  2) 添加规则  3) 修改规则\n"
-              "4) 删除规则  5) 查看规则  6) 启用规则  7) 停用规则\n"
-              "8) 重新应用  9) 查看服务状态  0) 返回")
-        try:
-            choice = input("请选择：").strip()
-            if choice == "0":
-                return
-            if choice == "5":
-                show_rules(manager.load())
-                continue
-            require_root()
-            with manager.lock():
-                if choice == "1":
-                    engine = selected or input("选择 nft / realm：").strip()
-                    if engine not in UNITS:
-                        raise RelayError("请选择 nft 或 realm。")
-                    manager.init(engine)
-                elif choice in ("2", "3"):
-                    manager.change("add" if choice == "2" else "set", *ask_rule())
-                elif choice in ("4", "6", "7"):
-                    manager.change({"4": "del", "6": "enable", "7": "disable"}[choice], input("规则名称：").strip())
-                elif choice == "8":
-                    manager.commit(manager.load())
-                elif choice == "9":
-                    status(manager)
-                else:
-                    print("无效选项。")
-        except EOFError:
-            return
-        except (RelayError, ValueError, OSError) as error:
-            print(f"错误：{error}", file=sys.stderr)
 
 
 def require_root():
@@ -655,6 +807,10 @@ def main(argv=None):
     edit.add_argument("--port", dest="listen", type=port)
     edit.add_argument("--address")
     edit.add_argument("--rotate", action="store_true")
+    edit.add_argument("--via")
+    edit.add_argument("--via-port", type=port)
+    edit.add_argument("--via-label")
+    edit.add_argument("--clear-via", action="store_true")
     for command in (node_add, edit):
         for option in ("sni", "cert", "key", "bind", "path", "method", "mode", "dns", "obfs"):
             command.add_argument("--" + option)
@@ -666,14 +822,21 @@ def main(argv=None):
     cert_parser = sub.add_parser("cert")
     cert_parser.add_argument("domain")
     cert_parser.add_argument("email")
-    for action in ("del", "enable", "disable", "link"):
+    for action in ("del", "enable", "disable", "link", "info"):
         node_sub.add_parser(action).add_argument("name")
+    for action in ("link", "info"):
+        node_sub.choices[action].add_argument("--via")
+        node_sub.choices[action].add_argument("--via-port", type=port)
     for action in ("list", "apply"):
         node_sub.add_parser(action)
     for action in ("status", "logs"):
         node_sub.add_parser(action).add_argument("name", nargs="?")
     install = sub.add_parser("install")
     install.add_argument("--launcher", required=True)
+    sub.add_parser("uninstall").add_argument("--yes", action="store_true")
+    core_sub = sub.add_parser("core").add_subparsers(dest="core_action", required=True)
+    core_sub.add_parser("list")
+    core_sub.add_parser("import").add_argument("files", nargs="+")
     init = sub.add_parser("init")
     init.add_argument("engine", choices=UNITS)
     for action in ("add", "set"):
@@ -687,38 +850,74 @@ def main(argv=None):
     sub.add_parser("logs").add_argument("engine", choices=UNITS)
     args = parser.parse_args(argv)
     manager = Manager()
-    if args.action is None:
-        top_menu(manager)
-        return
-    if args.action in ("nft", "realm"):
-        menu(manager, args.action)
+    if args.action in (None, "nft", "realm") or (args.action == "node" and args.node_action is None):
+        menu.open_menu(manager, args.action)
         return
     require_root()
     if args.action == "install":
         install_self(args.launcher)
+        return
+    if args.action == "uninstall":
+        try:
+            answer = "yes" if args.yes else input("将删除 Relay Kit 的全部规则、节点、配置和程序。输入 yes 确认：").strip()
+        except EOFError:
+            answer = ""
+        if answer != "yes":
+            print("已取消。")
+            return
+        with manager.lock():
+            uninstall(manager)
+        print("Relay Kit 已卸载。")
         return
     if args.action == "logs":
         print(run("journalctl", "-u", UNITS[args.engine], "-n", "50", "--no-pager").stdout)
         return
     if args.action == "bbr":
         with manager.lock():
-            bbr(manager, args.operation)
+            message = bbr(manager, args.operation)
+        if message:
+            print(message)
         return
     if args.action == "cert":
         certificate(args.domain, args.email)
         return
+    if args.action == "core":
+        nodes = NodeManager()
+        if args.core_action == "list":
+            installed = {name: present for name, _, present in nodes.cores()}
+            for name, version, machine, url, digest in official_assets():
+                if machine == platform.machine():
+                    print(f"{name} {version}  {'已安装' if installed[name] else '未安装'}\n  {url}\n  sha256 {digest}")
+            return
+        with nodes.lock():
+            for file in args.files:
+                print(f"已导入 {nodes.import_archive(file)}，SHA-256 校验通过。")
+        return
     if args.action == "node":
         nodes = NodeManager()
-        if args.node_action is None:
-            node_menu(nodes)
-            return
+        hint = blocked_port_note(args.listen) if args.node_action in ("add", "set") and args.listen else None
+        if hint:
+            print("提示：" + hint, file=sys.stderr)
         with nodes.lock():
             if args.node_action == "add":
                 options = {key: getattr(args, key) for key in NODE_OPTIONS if getattr(args, key, None) is not None}
-                nodes.add(args.kind, args.name, args.listen, args.address, options)
+                node = nodes.add(args.kind, args.name, args.listen, args.address, options)
+                print("节点已创建。连接信息（含凭据）：\n" + node_link(node))
             elif args.node_action == "set":
                 changes = {key: getattr(args, key) for key in NODE_OPTIONS | {"listen", "address", "rotate"}
                            if getattr(args, key, None) is not None}
+                if args.via or args.clear_via:
+                    node = next((item for item in nodes.load()["nodes"] if item["name"] == args.name), None)
+                    if node is None:
+                        raise RelayError(f"未找到节点：{args.name}")
+                    relays = [] if args.clear_via else node["options"].get("relays", [])
+                    if args.via:
+                        entry = relayed(node, args.via, args.via_port)
+                        relays = [item for item in relays if (item["address"], item["port"]) !=
+                                  (entry["address"], entry["listen"])]
+                        relays.append({"address": entry["address"], "port": entry["listen"],
+                                       "label": args.via_label or next_label(relays)})
+                    changes["relays"] = relays
                 nodes.change("set", args.name, changes)
             elif args.node_action == "list":
                 show_nodes(nodes.load())
@@ -731,6 +930,16 @@ def main(argv=None):
                 nodes.commit(current)
             elif args.node_action in ("status", "logs"):
                 node_service_info(nodes, args.node_action, args.name)
+            elif args.node_action in ("info", "link"):
+                node = next((item for item in nodes.load()["nodes"] if item["name"] == args.name), None)
+                if node is None:
+                    raise RelayError(f"未找到节点：{args.name}")
+                if args.via:
+                    node = relayed(node, args.via, args.via_port)
+                if args.node_action == "info":
+                    menu.show_node(nodes, node, fresh=False)
+                else:
+                    print(node_link(node))
             else:
                 nodes.change(args.node_action, args.name)
         return
@@ -738,6 +947,9 @@ def main(argv=None):
         if args.action == "init":
             manager.init(args.engine)
         elif args.action in ("add", "set"):
+            hint = blocked_port_note(args.listen, args.remote)
+            if hint:
+                print("提示：" + hint, file=sys.stderr)
             manager.change(args.action, args.name, args.proto, args.listen, args.target, args.remote)
         elif args.action in ("del", "enable", "disable"):
             manager.change(args.action, args.name)
@@ -756,7 +968,8 @@ def main(argv=None):
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 sys.modules.setdefault("relay", sys.modules[__name__])
 from nodes import (NodeManager, PROTOCOLS, OPTION_KEYS as NODE_OPTIONS, SS_METHOD,
-                   validate_nodes, node_ports, node_link, show_nodes)
+                   validate_nodes, next_label, node_ports, node_link, official_assets, relayed, show_nodes)
+import menu
 
 if __name__ == "__main__":
     try:

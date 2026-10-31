@@ -15,17 +15,28 @@ if (( ${#missing[@]} )); then
 fi
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
-base=https://raw.githubusercontent.com/YePiXpert/relay-kit/v0.2.0
-for file in forward.sh relay.py nodes.py; do
-    curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
-        --connect-timeout 15 --max-time 180 --retry 2 "$base/$file" --output "$work/$file"
+base=https://raw.githubusercontent.com/YePiXpert/relay-kit/v0.3.0
+# Mirror prefixes are tried only after GitHub fails; the SHA-256 check below decides what is installed.
+prefixes=${RELAY_KIT_MIRRORS-https://ghfast.top/ https://gh-proxy.com/}
+read -r -a mirrors <<< "${prefixes//,/ }"
+for file in forward.sh relay.py nodes.py menu.py; do
+    for prefix in '' "${mirrors[@]}"; do
+        [[ -z $prefix ]] || printf '改用镜像 %s 下载 %s，内容同样校验 SHA-256。\n' "$prefix" "$file" >&2
+        if curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+                --connect-timeout 15 --max-time 180 --retry 1 "$prefix$base/$file" --output "$work/$file"; then
+            continue 2
+        fi
+    done
+    printf '无法下载 %s；可下载完整仓库后执行 sudo bash forward.sh --install。\n' "$file" >&2
+    exit 1
 done
 (
     cd "$work"
     sha256sum --check <<'SUMS'
 cc357f101e4823914620fcc00748870e5b35622a5ee00e0c5b4614ad74c6185e  forward.sh
-e6fb821b93f052e8ab8ed4cd080a691ddb900066a8e7e2153d42c87bc9020f70  relay.py
-ef1f7e497d7dc7605aaaca48614a733650bdd3b98f7194ffd4dc895fb7db4f3d  nodes.py
+b0e3f7bb4e28428070426da53855f6b47bfbe2abdadd067faf03200deb29a398  relay.py
+e62f18b5ead554b3cb80936779adb34aa907c279e30c5add30d9269c5bc07dc7  nodes.py
+7126582bbffcfb7aa5f48e5eb2bcf3d917ba26dc532d7ae29ec4ccb954ad08a2  menu.py
 SUMS
 )
 bash -n "$work/forward.sh"

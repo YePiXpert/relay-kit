@@ -1,4 +1,5 @@
 """Verify the production DynamicUser/LoadCredential service with real systemd."""
+import os
 import pathlib
 import shutil
 import subprocess
@@ -15,7 +16,9 @@ import nodes
 
 def main():
     identifier = "relay-kit-check-" + uuid.uuid4().hex[:12]
-    directory = pathlib.Path(tempfile.mkdtemp(prefix=identifier, dir="/run"))
+    # Debian 13 mounts /run noexec; PrivateTmp hides /tmp and /var/tmp from the service.
+    base = "/var/lib" if os.statvfs("/run").f_flag & os.ST_NOEXEC else "/run"
+    directory = pathlib.Path(tempfile.mkdtemp(prefix=identifier, dir=base))
     directory.chmod(0o755)
     unit = pathlib.Path("/run/systemd/system") / (identifier + ".service")
     manager = nodes.NodeManager()

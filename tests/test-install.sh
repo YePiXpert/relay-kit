@@ -9,9 +9,10 @@ mount --make-rprivate /
 mount -t tmpfs tmpfs /usr/local/bin
 mount -t tmpfs tmpfs /usr/local/lib
 bash forward.sh --install
-[[ $(/usr/local/bin/relay --version) == 'Relay Kit 0.2.0' ]]
+[[ $(/usr/local/bin/relay --version) == 'Relay Kit 0.3.0' ]]
 [[ $(stat -c '%a' /usr/local/bin/relay) == 755 ]]
 [[ $(stat -c '%a' /usr/local/lib/relay-kit/relay.py) == 644 ]]
+[[ $(stat -c '%a' /usr/local/lib/relay-kit/menu.py) == 644 ]]
 bash forward.sh --install
 printf 'unrelated application\n' > /usr/local/bin/relay
 if bash forward.sh --install; then

@@ -3,6 +3,7 @@ import contextlib
 import json
 import os
 import pathlib
+import shutil
 import socket
 import subprocess
 import sys
@@ -166,12 +167,51 @@ while True:
         for proto in ("tcp", "udp"):
             probe("198.18.0.1", 20000, proto)
         assert unrelated == command("nft", "list", "table", "inet", "unrelated")
+        clamped = command("nft", "list", "chain", "ip", relay.TABLE, "forward")
+        assert "maxseg size set 1452" in clamped and "counter packets 0 " not in clamped, clamped
+        command("nft", "-f", "-", text="table ip po0wiki {\n chain prerouting {\n"
+                "  type nat hook prerouting priority dstnat; policy accept;\n"
+                "  meta l4proto { tcp, udp } th dport 30001 dnat to 11.0.0.2:30000\n }\n}\n")
+        clashes = relay.foreign_forwards(command("nft", "list", "ruleset"))
+        assert {(p, low, high) for p, low, high, _ in clashes} == {("tcp", 30001, 30001), ("udp", 30001, 30001)}, clashes
+        command("nft", "delete", "table", "ip", "po0wiki")
+        # A Docker/ufw-style forward chain with policy drop defeats our accept-by-default table.
+        command("nft", "-f", "-", text="table ip dockerish {\n chain forward {\n"
+                "  type filter hook forward priority filter; policy drop;\n }\n}\n")
+        assert relay.forward_blockers(command("nft", "list", "ruleset")) == ["ip dockerish forward"]
+        probe("198.18.0.1", 20000, "tcp", expect=False)
+        command("nft", "delete", "table", "ip", "dockerish")
+        probe("198.18.0.1", 20000, "tcp")
         state["rules"] = []
         command("nft", "-f", "-", text=relay.nft_config(state))
         for proto in ("tcp", "udp"):
             probe("198.18.0.1", 20000, proto, expect=False)
         command("nft", "delete", "table", "ip", relay.TABLE)
-        print("PASS nft TCP/UDP, source NAT, repeated apply, deletion and unrelated firewall preservation", flush=True)
+        print("PASS nft TCP/UDP, source NAT, MSS clamp, repeated apply, deletion, foreign DNAT and "
+              "forward-drop detection, unrelated firewall preservation", flush=True)
+        if shutil.which("iptables"):
+            listener = ("import socket\ns = socket.socket()\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+                        "s.bind(('0.0.0.0', 21999))\ns.listen()\nwhile True:\n    s.accept()[0].close()\n")
+            check = "import socket; socket.create_connection(('198.18.0.1', 21999), timeout=2).close()"
+
+            def reachable():
+                return not subprocess.run(["ip", "netns", "exec", "relay-client", "python3", "-c", check],
+                                          capture_output=True).returncode
+            with process(["python3", "-c", listener], directory / "listener.log"):
+                assert reachable()
+                command("iptables", "-A", "INPUT", "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT")
+                command("iptables", "-A", "INPUT", "-j", "REJECT", "--reject-with", "icmp-host-prohibited")
+                assert relay.firewall_backend() == "iptables" and not reachable()
+                relay.firewall_allow("iptables", "tcp", 21999)
+                rules = command("iptables", "-S", "INPUT").splitlines()
+                ours = next(index for index, rule in enumerate(rules) if "relay-kit" in rule)
+                assert ours < rules.index("-A INPUT -j REJECT --reject-with icmp-host-prohibited"), rules
+                assert reachable()
+                relay.firewall_remove("iptables", "tcp", 21999)
+                assert not reachable() and "relay-kit" not in command("iptables", "-S", "INPUT")
+                command("iptables", "-F", "INPUT")
+            print("PASS host firewall: iptables INPUT opened before an Oracle-style REJECT, then removed by tag",
+                  flush=True)
         for mode in ("tcp", "udp", "both"):
             value = {"engine": "realm", "rules": [{"name": "test", "proto": mode, "listen": 20000,
                      "host": "11.0.0.2", "remote": 30000, "enabled": True}]}
